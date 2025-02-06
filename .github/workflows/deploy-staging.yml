@@ -37,7 +37,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64
-          context: ./mysql  # Ensure correct MySQL Dockerfile context
+          context: .
           push: true
           tags: vighasks/todolist-mysql:v1.0
 
@@ -54,23 +54,19 @@ jobs:
           script: |
             docker network create --driver bridge image-network || true
 
+            docker pull vighasks/todolist-docker-app:v1.0
+            docker stop todolist-docker-app || true
+            docker rm todolist-docker-app || true
+            docker run --privileged -d --name todolist-docker-app -p 8081:4000 \
+              --network image-network \
+              vighasks/todolist-docker-app:v1.0
+
             docker pull vighasks/todolist-mysql:v1.0
             docker stop todolist-docker-mysql || true
             docker rm todolist-docker-mysql || true
             docker run -d --name todolist-docker-mysql --network image-network \
               -e MYSQL_ROOT_PASSWORD=root_password \
               -p 3306:3306 vighasks/todolist-mysql:v1.0
-
-            echo "Waiting for MySQL to initialize..."
-            sleep 10  # Ensuring MySQL is ready before app starts
-
-            docker pull vighasks/todolist-docker-app:v1.0
-            docker stop todolist-docker-app || true
-            docker rm todolist-docker-app || true
-            docker run --privileged -d --name todolist-docker-app -p 8081:3000 \
-              --network image-network \
-              -e DATABASE_URL="mysql://root:root_password@todolist-docker-mysql:3306/db_name" \
-              vighasks/todolist-docker-app:v1.0
 
             docker exec todolist-docker-app npx prisma migrate deploy
             docker system prune -f --volumes
