@@ -1,20 +1,17 @@
-name: Docker Deployment Workflow
+name: Deploy to Staging
 
 on:
   push:
     branches:
-      - main
+      - main  # Or any branch that triggers the workflow
 
 jobs:
-  build_and_push:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
 
       - name: Log in to DockerHub
         uses: docker/login-action@v2
@@ -22,69 +19,56 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build and Test Docker Image
+      - name: Build Docker image
         run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/my-app:$GITHUB_SHA .
-          docker run --rm ${{ secrets.DOCKER_USERNAME }}/my-app:$GITHUB_SHA /bin/bash -c "run_tests.sh"  # Replace with actual test command
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }} .
 
-      - name: Push Docker Image
+      - name: Run tests inside the Docker container
         run: |
-          docker push ${{ secrets.DOCKER_USERNAME }}/my-app:$GITHUB_SHA
+          docker run --rm ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }} /bin/sh -c "run_tests.sh"
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build_and_push
-    steps:
-      - name: Set up SSH for Deployment
+      - name: Push Docker image to DockerHub
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SERVER_PASSWORD }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-        env:
-          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }}
 
-      - name: SSH into the Deployment Server and Deploy Docker Image
+      - name: Deploy to Staging (Manual Rolling Update)
         run: |
-          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USERNAME }}@${{ secrets.SERVER_IP }} << 'EOF'
-            # Stop and remove the old container (v1) if exists
-            docker stop my-app-v1 || true
-            docker rm my-app-v1 || true
+          # SSH into the staging server
+          ssh user@staging-server << 'EOF'
+          # Pull the new Docker image
+          docker pull ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }}
 
-            # Pull the new Docker image
-            docker pull ${{ secrets.DOCKER_USERNAME }}/my-app:$GITHUB_SHA
+          # Run the new container (v2) on a different port
+          docker run -d --name my-app-v2 -p 8081:80 ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }}
 
-            # Run the new container (v2) on a different port (8081)
-            docker run -d --name my-app-v2 -p 8081:80 ${{ secrets.DOCKER_USERNAME }}/my-app:$GITHUB_SHA
+          # Update the reverse proxy (Nginx) to route traffic to the new container
+          sed -i 's/8080/8081/' /etc/nginx/sites-available/default
+          nginx -s reload
 
-            # Update Nginx configuration to route traffic to the new container
-            sed -i 's/8080/8081/' /etc/nginx/sites-available/default  # Update to the new port
-
-            # Reload Nginx to apply changes
-            nginx -s reload
-
-            # Validate the new container is working
-            curl -f http://localhost:8081 || exit 1  # Exit with error if validation fails
-
-            # Remove the old container (v1) after successful validation
-            docker stop my-app-v1
-            docker rm my-app-v1
+          # Validate the new version (you can add more specific checks here)
+          # If the validation fails, do not proceed with removing the old container
+          if curl -s http://localhost:8081 | grep -q "expected_output"; then
+              # Remove old container (v1) if the validation is successful
+              docker rm -f my-app-v1
+          else
+              echo "Validation failed. Rolling back to previous version."
+              exit 1
+          fi
           EOF
 
-  rollback:
-    runs-on: ubuntu-latest
-    needs: deploy
-    if: failure()
-    steps:
-      - name: Rollback to the old version
+      - name: Rollback Strategy (If Deployment Fails)
+        if: failure()
         run: |
-          sshpass -p "${{ secrets.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USERNAME }}@${{ secrets.SERVER_IP }} << 'EOF'
-            # Stop and remove the new container (v2) if exists
-            docker stop my-app-v2 || true
-            docker rm my-app-v2 || true
+          # SSH into the staging server and revert to v1 container if v2 fails
+          ssh user@staging-server << 'EOF'
+          # Ensure the new container (v2) is stopped and removed
+          docker stop my-app-v2 || true
+          docker rm my-app-v2 || true
 
-            # Rollback to the old container (v1) and restart it
-            docker run -d --name my-app-v1 -p 8080:80 ${{ secrets.DOCKER_USERNAME }}/my-app:v1
+          # Revert Nginx configuration to route traffic back to v1 container
+          sed -i 's/8081/8080/' /etc/nginx/sites-available/default
+          nginx -s reload
 
-            # Reload Nginx to route traffic back to v1
-            nginx -s reload
+          # Restart the old container (v1) if needed
+          docker start my-app-v1
           EOF
