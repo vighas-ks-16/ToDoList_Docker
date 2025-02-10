@@ -1,30 +1,26 @@
-# Use an optimized Node.js Alpine base image
+# Use the official Node.js image with Alpine as the base image
 FROM node:20-alpine
 
-# Set environment variable for production
-ENV NODE_ENV=production
-
-# Install dependencies for debugging
+# Install necessary dependencies
 RUN apk add --no-cache curl
 
-# Set the working directory
+# Set the working directory in the container
 WORKDIR /app
 
-# Copy only necessary files
+# Copy the package.json and yarn.lock files to the container
 COPY package.json yarn.lock ./
 
-# Install production dependencies
+# Install the dependencies using yarn
 RUN yarn install --production
 
-# Copy the rest of the application files
+# Copy the rest of the application files to the container
 COPY . .
 
-# Set a non-root user for security
-RUN adduser -D node
+# Set a non-root user for security (use the existing `node` user)
 USER node
 
-# Expose the required port
+# Expose the port your app will run on
 EXPOSE 3000
 
-# Start the application
-CMD ["node", "src/index.js"]
+# Command to run the application
+CMD ["yarn", "start"]
