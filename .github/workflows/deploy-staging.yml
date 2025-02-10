@@ -3,7 +3,7 @@ name: Deploy to Staging
 on:
   push:
     branches:
-      - main  # Or any branch that triggers the workflow
+      - main  # Trigger deployment on push to main
 
 jobs:
   build-and-deploy:
@@ -19,56 +19,70 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build Docker image
+      - name: Build Docker Image
         run: |
-          docker build -t ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }} .
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/todolist-docker-app:${{ github.sha }} .
 
-      - name: Run tests inside the Docker container
+      - name: Run Tests Inside Docker Container
         run: |
-          docker run --rm ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }} /bin/sh -c "run_tests.sh"
+          docker run --rm ${{ secrets.DOCKER_USERNAME }}/todolist-docker-app:${{ github.sha }} yarn test || exit 1
 
-      - name: Push Docker image to DockerHub
+      - name: Push Docker Image to DockerHub
         run: |
-          docker push ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }}
+          docker push ${{ secrets.DOCKER_USERNAME }}/todolist-docker-app:${{ github.sha }}
 
-      - name: Deploy to Staging (Manual Rolling Update)
-        run: |
-          # SSH into the staging server
-          ssh user@staging-server << 'EOF'
-          # Pull the new Docker image
-          docker pull ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }}
+      - name: Deploy to Staging Server
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          script: |
+            docker pull ${{ secrets.DOCKER_USERNAME }}/todolist-docker-app:${{ github.sha }}
 
-          # Run the new container (v2) on a different port
-          docker run -d --name my-app-v2 -p 8081:80 ${{ secrets.DOCKER_USERNAME }}/my-app:${{ github.sha }}
+            # Start the new container (v2) on a different port (e.g., 3001)
+            docker run -d --name todolist-app-v2 -p 3001:3000 \
+              -e MYSQL_HOST=${{ secrets.MYSQL_HOST }} \
+              -e MYSQL_USER=${{ secrets.MYSQL_USER }} \
+              -e MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }} \
+              -e MYSQL_DB=${{ secrets.MYSQL_DB }} \
+              ${{ secrets.DOCKER_USERNAME }}/todolist-docker-app:${{ github.sha }}
 
-          # Update the reverse proxy (Nginx) to route traffic to the new container
-          sed -i 's/8080/8081/' /etc/nginx/sites-available/default
-          nginx -s reload
+            # Update reverse proxy configuration (e.g., Nginx) to route some traffic to the new container (v2)
+            # Assuming Nginx config file is at /etc/nginx/sites-available/default
+            echo "
+            server {
+                listen 80;
+                server_name your_domain_or_ip;
+                
+                location / {
+                    proxy_pass http://localhost:3001;  # Route some traffic to the new container
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto \$scheme;
+                }
+            }
+            " > /etc/nginx/sites-available/default
 
-          # Validate the new version (you can add more specific checks here)
-          # If the validation fails, do not proceed with removing the old container
-          if curl -s http://localhost:8081 | grep -q "expected_output"; then
-              # Remove old container (v1) if the validation is successful
-              docker rm -f my-app-v1
-          else
-              echo "Validation failed. Rolling back to previous version."
+            # Reload Nginx to apply the changes
+            sudo systemctl reload nginx
+
+            # Verify if the new container is running
+            docker ps | grep todolist-app-v2 || exit 1
+
+            # Validate that the new container (v2) is functioning as expected
+            # You can add additional validation steps here if needed
+
+            # If validation fails, rollback to the old container (v1)
+            if [ $? -ne 0 ]; then
+              echo "New container failed. Rolling back to v1..."
+              docker stop todolist-app-v2 || true
+              docker rm todolist-app-v2 || true
+              docker start todolist-app || true
               exit 1
-          fi
-          EOF
+            fi
 
-      - name: Rollback Strategy (If Deployment Fails)
-        if: failure()
-        run: |
-          # SSH into the staging server and revert to v1 container if v2 fails
-          ssh user@staging-server << 'EOF'
-          # Ensure the new container (v2) is stopped and removed
-          docker stop my-app-v2 || true
-          docker rm my-app-v2 || true
-
-          # Revert Nginx configuration to route traffic back to v1 container
-          sed -i 's/8081/8080/' /etc/nginx/sites-available/default
-          nginx -s reload
-
-          # Restart the old container (v1) if needed
-          docker start my-app-v1
-          EOF
+            # After successful validation, remove the old container (v1)
+            docker stop todolist-app || true
+            docker rm todolist-app || true
